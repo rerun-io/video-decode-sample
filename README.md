@@ -1,6 +1,6 @@
 ```
 npm i
-python -m http.server 8080 --dir .
+npm run start
 open http://localhost:8080
 ```
 

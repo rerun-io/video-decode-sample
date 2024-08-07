@@ -413,21 +413,6 @@ function latestAt(arr, target, key) {
   return arr[latestAtIdx(arr, target, key)];
 }
 
-class Frame {
-  constructor(
-    /** @type {GPUTexture} */
-    texture,
-    /** @type {number} */
-    timestamp,
-    /** @type {number} */
-    duration
-  ) {
-    this.texture = texture;
-    this.timestamp = timestamp;
-    this.duration = duration;
-  }
-}
-
 /**
  * @typedef {{
  *   type: "key" | "delta",
@@ -445,26 +430,16 @@ class Frame {
 
 class Video2 {
   /**
-   * How many frames to buffer.
-   */
-  // Assuming playback of 30 fps, this should be enough for 4 seconds of playback,
-  // or immediate seek to anywhere in those 4 seconds.
-  static BUFFER_SIZE = 128;
-
-  /** Whatever was passed into the last call to `getFrame`. */
-  _lastFrameTime = 0;
-
-  /**
    * Loaded frames, always sorted in ascending order.
    *
-   * @type {Frame[]}
+   * @type {VideoFrame[]}
    */
   _frames = [];
+  /** @type {VideoFrame | null} */
+  _lastUsedFrame = null;
 
-  /** @type {GPUTexture[]} */
-  _unusedTextures = [];
-
-  _currentSegmentIdx = -1000;
+  /** @type {{ segment: number, sample: number }} */
+  _currentPosition = { segment: -1000, sample: -1000 };
 
   static async load(/** @type {string} */ url) {
     const unboxed = await unboxVideo(url);
@@ -524,6 +499,12 @@ class Video2 {
      */
     this.timeOffset = segments[0].start;
 
+    this._texture = allocVideoFrameTexture(
+      this.device,
+      /** @type {number} */ (this.videoDecoderConfig.codedWidth),
+      /** @type {number} */ (this.videoDecoderConfig.codedHeight)
+    );
+
     // immediately start buffering frames from the beginning of the video
     this._reset();
     this.getFrame(0);
@@ -537,57 +518,71 @@ class Video2 {
   /**
    * Get the latest frame at the given time.
    *
-   * @param {number} timestamp in seconds
-   * @returns {Frame | undefined}
+   * @param {number} timestamp in time units
+   * @returns {GPUTexture | undefined}
    */
   getFrame(timestamp) {
     timestamp = timestamp + this.timeOffset;
 
     const newSegmentIdx = latestAtIdx(this.segments, timestamp, (s) => s.start);
+    const newSampleIdx = latestAtIdx(
+      this.segments[newSegmentIdx].samples,
+      timestamp,
+      (s) => s.timestamp
+    );
     // NOTE: this check handles
     // - backward seek within a single segment, we already have those frames buffered
     // - forward seek past the duration of the video (timestamp > duration)
     // - backward seek past the start of the video (timestamp < 0)
-    if (newSegmentIdx !== this._currentSegmentIdx) {
-      // 1. clear unused frames from last segment
-      const latestUsedFrameIdx = latestAtIdx(
-        this._frames,
-        this.segments[newSegmentIdx].start,
-        (f) => f.timestamp
-      );
-      for (const frame of this._frames.splice(0, latestUsedFrameIdx)) {
-        this._unusedTextures.push(frame.texture);
-      }
-
-      // 2. buffer more samples from new segment
+    if (newSegmentIdx !== this._currentPosition.segment) {
+      // buffer more samples from new segment
       // we maintain a buffer of all samples in segments `N` and `N+1`
-
-      let segmentDistance = newSegmentIdx - this._currentSegmentIdx;
+      let segmentDistance = newSegmentIdx - this._currentPosition.segment;
       if (segmentDistance === 1) {
-        // forward seek by 1: no reset, buffer all samples from `newSegmentIdx+1`
-        // NOTE: we are guaranteed to have another segment after `newSegmentIdx`
-        //       because of the `newSegmentIdx != currentSegmentIdx` check
+        // forward seek by 1
         this._enqueueAll(this.segments[newSegmentIdx + 1]);
       } else {
-        // forward seek by N>1 OR backward seek: reset, buffer all samples from `newSegmentIdx` and `newSegmentIdx+1`
+        // forward seek by N>1 OR backward seek across segments
         this._reset();
         this._enqueueAll(this.segments[newSegmentIdx]);
         this._enqueueAll(this.segments[newSegmentIdx + 1]);
       }
-
-      this._currentSegmentIdx = newSegmentIdx;
+    } else if (newSampleIdx !== this._currentPosition.sample) {
+      // segment index unchanged, but sample index did change
+      const sampleDistance = newSampleIdx - this._currentPosition.sample;
+      if (sampleDistance < 0) {
+        // backward seek within a segment
+        this._reset();
+        this._enqueueAll(this.segments[newSegmentIdx]);
+        this._enqueueAll(this.segments[newSegmentIdx + 1]);
+      }
     }
 
-    const frame = latestAt(this._frames, timestamp, (frame) => frame.timestamp);
-    if (!frame) {
+    this._currentPosition.segment = newSegmentIdx;
+    this._currentPosition.sample = newSampleIdx;
+
+    const currentFrameIdx = latestAtIdx(this._frames, timestamp, (frame) => frame.timestamp);
+    const currentFrame = this._frames[currentFrameIdx];
+    if (!currentFrame) {
       // no buffered frames
       return;
     }
-    if (timestamp - frame.timestamp > frame.duration) {
+
+    // clear old frames so the decoder can output more
+    for (const frame of this._frames.splice(0, currentFrameIdx)) {
+      frame.close();
+    }
+
+    if (timestamp - currentFrame.timestamp > (currentFrame.duration ?? 0)) {
       // not relevant to the user, it's an old frame.
       return;
     }
-    return frame;
+
+    if (this._lastUsedFrame !== currentFrame) {
+      copyVideoFrameToTexture(this.device, currentFrame, this._texture);
+      this._lastUsedFrame = currentFrame;
+    }
+    return this._texture;
   }
 
   /**
@@ -596,9 +591,8 @@ class Video2 {
   _reset() {
     this.videoDecoder.reset();
     this.videoDecoder.configure(this.videoDecoderConfig);
-
     for (const frame of this._frames) {
-      this._unusedTextures.push(frame.texture);
+      frame.close();
     }
     this._frames.length = 0;
   }
@@ -622,8 +616,6 @@ class Video2 {
    * ⚠ The first sample after a reset must have type `key`
    */
   _enqueue(/** @type {Sample} */ sample) {
-    // this._frames.push(new Frame(this._texture(1280, 720), sample.timestamp, sample.duration));
-
     this.videoDecoder.decode(
       new EncodedVideoChunk({
         type: sample.type,
@@ -634,36 +626,9 @@ class Video2 {
     );
   }
 
-  /**
-   * Allocate a texture with the given dimensions
-   *
-   * @param {number} width
-   * @param {number} height
-   */
-  _texture(width, height) {
-    let texture = this._unusedTextures.pop();
-    if (!texture || texture.width !== width || texture.height !== height) {
-      // width and height may have changed, free all unused textures
-      for (const texture of this._unusedTextures) {
-        texture.destroy();
-      }
-      this._unusedTextures.length = 0;
-
-      texture = allocVideoFrameTexture(this.device, width, height);
-    }
-
-    return texture;
-  }
-
   /** Called by the video decoder when a full frame is ready. */
   _output = (/** @type {VideoFrame} */ frame) => {
-    // console.log(frame);
-    const texture = this._texture(frame.codedWidth, frame.codedHeight);
-    copyVideoFrameToTexture(this.device, frame, texture);
-    frame.close();
-
-    // NOTE: frames arrive in order
-    this._frames.push(new Frame(texture, frame.timestamp, frame.duration ?? 0));
+    this._frames.push(frame);
   };
 }
 
@@ -814,8 +779,8 @@ window._video = video;
 const timeline = new VideoController(video, document.querySelector(".controls"));
 
 function render() {
-  const frame = video.getFrame(timeline.currentTimeTs);
-  if (frame) renderer.draw(frame.texture);
+  const texture = video.getFrame(timeline.currentTimeTs);
+  if (texture) renderer.draw(texture);
   requestAnimationFrame(render);
 }
 requestAnimationFrame(render);
