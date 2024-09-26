@@ -4,6 +4,169 @@
 import { DataStream } from "./mp4box.js";
 import * as MP4Box from "./mp4box.js";
 
+/** @implements {VideoRenderer} */
+class WebGLRenderer {
+  /** @type {HTMLCanvasElement} */
+  canvas;
+  /** @type {WebGLRenderingContext} */
+  ctx;
+
+  static vertexShaderSource = `
+    attribute vec2 xy;
+
+    varying highp vec2 uv;
+
+    void main(void) {
+      gl_Position = vec4(xy, 0.0, 1.0);
+      // Map vertex coordinates (-1 to +1) to UV coordinates (0 to 1).
+      // UV coordinates are Y-flipped relative to vertex coordinates.
+      uv = vec2((1.0 + xy.x) / 2.0, (1.0 - xy.y) / 2.0);
+    }
+  `;
+
+  static fragmentShaderSource = `
+    varying highp vec2 uv;
+
+    uniform sampler2D texture;
+
+    void main(void) {
+      gl_FragColor = texture2D(texture, uv);
+    }
+  `;
+
+  /** @param {HTMLCanvasElement} canvas */
+  constructor(canvas) {
+    this.canvas = canvas;
+
+    const ctx = this.canvas.getContext("webgl");
+    if (!ctx) {
+      throw new Error("failed to get webgl context");
+    }
+    this.ctx = ctx;
+
+    const vertexShader = ctx.createShader(ctx.VERTEX_SHADER);
+    if (!vertexShader) {
+      throw new Error("failed to create vertex shader");
+    }
+    ctx.shaderSource(vertexShader, WebGLRenderer.vertexShaderSource);
+    ctx.compileShader(vertexShader);
+    if (!ctx.getShaderParameter(vertexShader, ctx.COMPILE_STATUS)) {
+      throw ctx.getShaderInfoLog(vertexShader);
+    }
+
+    const fragmentShader = ctx.createShader(ctx.FRAGMENT_SHADER);
+    if (!fragmentShader) {
+      throw new Error("failed to create fragment shader");
+    }
+    ctx.shaderSource(fragmentShader, WebGLRenderer.fragmentShaderSource);
+    ctx.compileShader(fragmentShader);
+    if (!ctx.getShaderParameter(fragmentShader, ctx.COMPILE_STATUS)) {
+      throw ctx.getShaderInfoLog(fragmentShader);
+    }
+
+    const shaderProgram = ctx.createProgram();
+    if (!shaderProgram) {
+      throw new Error("failed to create shader program");
+    }
+    ctx.attachShader(shaderProgram, vertexShader);
+    ctx.attachShader(shaderProgram, fragmentShader);
+    ctx.linkProgram(shaderProgram);
+    if (!ctx.getProgramParameter(shaderProgram, ctx.LINK_STATUS)) {
+      throw ctx.getProgramInfoLog(shaderProgram);
+    }
+    ctx.useProgram(shaderProgram);
+
+    // Vertex coordinates, clockwise from bottom-left.
+    const vertexBuffer = ctx.createBuffer();
+    ctx.bindBuffer(ctx.ARRAY_BUFFER, vertexBuffer);
+    ctx.bufferData(
+      ctx.ARRAY_BUFFER,
+      new Float32Array([-1.0, -1.0, -1.0, +1.0, +1.0, +1.0, +1.0, -1.0]),
+      ctx.STATIC_DRAW
+    );
+
+    const xyLocation = ctx.getAttribLocation(shaderProgram, "xy");
+    ctx.vertexAttribPointer(xyLocation, 2, ctx.FLOAT, false, 0, 0);
+    ctx.enableVertexAttribArray(xyLocation);
+
+    // Create one texture to upload frames to.
+    const texture = ctx.createTexture();
+    ctx.bindTexture(ctx.TEXTURE_2D, texture);
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MAG_FILTER, ctx.NEAREST);
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MIN_FILTER, ctx.NEAREST);
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_WRAP_S, ctx.CLAMP_TO_EDGE);
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_WRAP_T, ctx.CLAMP_TO_EDGE);
+  }
+
+  /** @param {VideoTexture} texture */
+  _resize(texture) {
+    const targetWidth = 1024;
+    const targetHeight = 576;
+
+    let frameAspectRatio = texture.width / texture.height;
+    let targetAspectRatio = targetWidth / targetHeight;
+
+    let scale;
+    if (frameAspectRatio > targetAspectRatio) {
+      // image is wider relative to target
+      scale = targetWidth / texture.width;
+    } else {
+      // image is taller relative to target
+      scale = targetHeight / texture.height;
+    }
+
+    this.canvas.width = texture.width * scale;
+    this.canvas.height = texture.height * scale;
+  }
+
+  /** @param {VideoTexture} texture */
+  async draw(texture) {
+    this._resize(texture);
+
+    const ctx = this.ctx;
+
+    // Configure and clear the drawing area.
+    ctx.viewport(0, 0, ctx.drawingBufferWidth, ctx.drawingBufferHeight);
+    ctx.clearColor(1.0, 0.0, 0.0, 1.0);
+    ctx.clear(ctx.COLOR_BUFFER_BIT);
+
+    // Draw the frame.
+    ctx.drawArrays(ctx.TRIANGLE_FAN, 0, 4);
+  }
+
+  /**
+   * @param {number} width
+   * @param {number} height
+   * @returns {VideoTexture}
+   */
+  allocTexture(width, height) {
+    const texture = this.ctx.createTexture();
+    this.ctx.bindTexture(this.ctx.TEXTURE_2D, texture);
+    this.ctx.texParameteri(this.ctx.TEXTURE_2D, this.ctx.TEXTURE_MAG_FILTER, this.ctx.NEAREST);
+    this.ctx.texParameteri(this.ctx.TEXTURE_2D, this.ctx.TEXTURE_MIN_FILTER, this.ctx.NEAREST);
+    this.ctx.texParameteri(this.ctx.TEXTURE_2D, this.ctx.TEXTURE_WRAP_S, this.ctx.CLAMP_TO_EDGE);
+    this.ctx.texParameteri(this.ctx.TEXTURE_2D, this.ctx.TEXTURE_WRAP_T, this.ctx.CLAMP_TO_EDGE);
+    return {
+      handle: texture,
+      width,
+      height,
+      /** @param {VideoFrame} frame */
+      copyFrom: (frame) => {
+        this.ctx.texImage2D(
+          this.ctx.TEXTURE_2D,
+          0,
+          this.ctx.RGBA,
+          this.ctx.RGBA,
+          this.ctx.UNSIGNED_BYTE,
+          frame
+        );
+        frame.close();
+      },
+    };
+  }
+}
+
+/** @implements {VideoRenderer} */
 class WebGPURenderer {
   /** @type {HTMLCanvasElement} */
   canvas;
@@ -109,39 +272,36 @@ class WebGPURenderer {
     return self;
   }
 
-  /** @param {GPUTexture} frame */
-  _resize(frame) {
+  /** @param {VideoTexture} texture */
+  _resize(texture) {
     const targetWidth = 1024;
     const targetHeight = 576;
 
-    let frameAspectRatio = frame.width / frame.height;
+    let frameAspectRatio = texture.width / texture.height;
     let targetAspectRatio = targetWidth / targetHeight;
 
     let scale;
     if (frameAspectRatio > targetAspectRatio) {
       // image is wider relative to target
-      scale = targetWidth / frame.width;
+      scale = targetWidth / texture.width;
     } else {
       // image is taller relative to target
-      scale = targetHeight / frame.height;
+      scale = targetHeight / texture.height;
     }
 
-    this.canvas.width = frame.width * scale;
-    this.canvas.height = frame.height * scale;
+    this.canvas.width = texture.width * scale;
+    this.canvas.height = texture.height * scale;
   }
 
-  /**
-   *
-   * @param {GPUTexture} frame
-   */
-  async draw(frame) {
-    this._resize(frame);
+  /** @param {VideoTexture} texture */
+  async draw(texture) {
+    this._resize(texture);
 
     const uniformBindGroup = this.device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 1, resource: this.sampler },
-        { binding: 2, resource: frame.createView() },
+        { binding: 2, resource: texture.handle.createView() },
       ],
     });
 
@@ -163,6 +323,61 @@ class WebGPURenderer {
     passEncoder.draw(6, 1, 0, 0);
     passEncoder.end();
     this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  allocTexture(width, height) {
+    const texture = this.device.createTexture({
+      label: `frame ${frames.length}`,
+      size: {
+        width,
+        height,
+        depthOrArrayLayers: 1,
+      },
+      mipLevelCount: 1,
+      sampleCount: 1,
+      dimension: "2d",
+      format: "rgba8unorm",
+      usage:
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.TEXTURE_BINDING |
+        GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    return {
+      handle: texture,
+      width,
+      height,
+      /** @param {VideoFrame} frame */
+      copyFrom: (frame) => {
+        let codedRect = frame.codedRect;
+        if (!codedRect) {
+          codedRect = new DOMRectReadOnly(0, 0, frame.codedWidth, frame.codedHeight);
+        }
+
+        this.device.queue.copyExternalImageToTexture(
+          {
+            source: frame,
+            origin: {
+              x: 0,
+              y: 0,
+            },
+            flipY: false,
+          },
+          {
+            texture,
+            mipLevel: 0,
+            origin: [0, 0, 0],
+            aspect: "all",
+            colorSpace: "srgb",
+            premultipliedAlpha: false,
+          },
+          {
+            width: frame.displayWidth,
+            height: frame.displayHeight,
+            depthOrArrayLayers: 1,
+          }
+        );
+      },
+    };
   }
 }
 
@@ -300,68 +515,6 @@ async function unboxVideo(url) {
 }
 
 /**
- * @param {GPUDevice} device
- * @param {number} width
- * @param {number} height
- * @returns {GPUTexture}
- */
-function allocVideoFrameTexture(device, width, height) {
-  const texture = device.createTexture({
-    label: `frame ${frames.length}`,
-    size: {
-      width,
-      height,
-      depthOrArrayLayers: 1,
-    },
-    mipLevelCount: 1,
-    sampleCount: 1,
-    dimension: "2d",
-    format: "rgba8unorm",
-    usage:
-      GPUTextureUsage.COPY_DST |
-      GPUTextureUsage.TEXTURE_BINDING |
-      GPUTextureUsage.RENDER_ATTACHMENT,
-  });
-  return texture;
-}
-
-/**
- * @param {GPUDevice} device
- * @param {VideoFrame} frame
- * @param {GPUTexture} texture
- */
-function copyVideoFrameToTexture(device, frame, texture) {
-  let codedRect = frame.codedRect;
-  if (!codedRect) {
-    codedRect = new DOMRectReadOnly(0, 0, frame.codedWidth, frame.codedHeight);
-  }
-
-  device.queue.copyExternalImageToTexture(
-    {
-      source: frame,
-      origin: {
-        x: 0,
-        y: 0,
-      },
-      flipY: false,
-    },
-    {
-      texture,
-      mipLevel: 0,
-      origin: [0, 0, 0],
-      aspect: "all",
-      colorSpace: "srgb",
-      premultipliedAlpha: false,
-    },
-    {
-      width: frame.displayWidth,
-      height: frame.displayHeight,
-      depthOrArrayLayers: 1,
-    }
-  );
-}
-
-/**
  * @param {number} n
  * @param {number} min
  * @param {number} max
@@ -428,6 +581,20 @@ function latestAt(arr, target, key) {
  * }} Segment
  */
 
+/**
+ * @typedef {{
+ *   handle: any;
+ *   width: number;
+ *   height: number;
+ *   copyFrom(frame: VideoFrame): void;
+ * }} VideoTexture
+ *
+ * @typedef {{
+ *   allocTexture(width: number, height: number): VideoTexture;
+ *   draw(texture: VideoTexture): Promise<void>;
+ * }} VideoRenderer
+ */
+
 class Video2 {
   /**
    * Loaded frames, always sorted in ascending order.
@@ -441,19 +608,23 @@ class Video2 {
   /** @type {{ segment: number, sample: number }} */
   _currentPosition = { segment: -1000, sample: -1000 };
 
-  static async load(/** @type {string} */ url) {
+  static async load(/** @type {VideoRenderer} */ renderer, /** @type {string} */ url) {
     const unboxed = await unboxVideo(url);
     console.log(unboxed);
 
     const { config, supported } = await VideoDecoder.isConfigSupported(unboxed.videoDecoderConfig);
     if (!supported) {
       throw new Error(
-        `video decoder does not support config: ${JSON.stringify(unboxed.videoDecoderConfig, null, 2)}`
+        `video decoder does not support config: ${JSON.stringify(
+          unboxed.videoDecoderConfig,
+          null,
+          2
+        )}`
       );
     }
 
     return new Video2(
-      renderer.device,
+      renderer,
       unboxed.segments,
       config ?? unboxed.videoDecoderConfig,
       unboxed.duration,
@@ -463,8 +634,8 @@ class Video2 {
   }
 
   constructor(
-    /** @type {GPUDevice} */
-    device,
+    /** @type {VideoRenderer} */
+    renderer,
 
     /** @type {Segment[]} */
     segments,
@@ -477,7 +648,7 @@ class Video2 {
     /** @type {ArrayBuffer} */
     data
   ) {
-    this.device = device;
+    this.renderer = renderer;
     this.segments = segments;
     this.videoDecoderConfig = videoDecoderConfig;
     this.videoDecoder = new VideoDecoder({
@@ -499,8 +670,7 @@ class Video2 {
      */
     this.timeOffset = segments[0].start;
 
-    this._texture = allocVideoFrameTexture(
-      this.device,
+    this._texture = this.renderer.allocTexture(
       /** @type {number} */ (this.videoDecoderConfig.codedWidth),
       /** @type {number} */ (this.videoDecoderConfig.codedHeight)
     );
@@ -519,7 +689,7 @@ class Video2 {
    * Get the latest frame at the given time.
    *
    * @param {number} timestamp in time units
-   * @returns {GPUTexture | undefined}
+   * @returns {VideoTexture | undefined}
    */
   getFrame(timestamp) {
     timestamp = timestamp + this.timeOffset;
@@ -579,7 +749,7 @@ class Video2 {
     }
 
     if (this._lastUsedFrame !== currentFrame) {
-      copyVideoFrameToTexture(this.device, currentFrame, this._texture);
+      this._texture.copyFrom(currentFrame);
       this._lastUsedFrame = currentFrame;
     }
     return this._texture;
@@ -765,12 +935,47 @@ const icons = {
   loading: "⟳",
 };
 
-let renderer = await WebGPURenderer.init(
-  /** @type {HTMLCanvasElement} */ (document.querySelector("canvas"))
-);
+const canvas = /** @type {HTMLCanvasElement} */ (document.querySelector("canvas"));
 
-let url = new URLSearchParams(window.location.search).get("url") ?? `data/bbb_video_av1_frag.mp4`;
-const video = await Video2.load(url);
+const searchParams = new URLSearchParams(window.location.search);
+
+const rendererName = searchParams.get("renderer");
+
+/** @type {VideoRenderer} */
+let renderer;
+switch (rendererName) {
+  case "webgl":
+    renderer = new WebGLRenderer(canvas);
+    break;
+  case "webgpu":
+    try {
+      renderer = await WebGPURenderer.init(canvas);
+    } catch (e) {
+      console.error(e);
+      console.warn("falling back to webgl");
+      renderer = new WebGLRenderer(canvas);
+    }
+    break;
+  case undefined:
+  case null:
+    if (navigator.gpu) {
+      try {
+        renderer = await WebGPURenderer.init(canvas);
+      } catch (e) {
+        console.error(e);
+        console.warn("falling back to webgl");
+        renderer = new WebGLRenderer(canvas);
+      }
+    } else {
+      renderer = new WebGLRenderer(canvas);
+    }
+    break;
+  default:
+    throw new Error(`unknown renderer: ${rendererName}`);
+}
+
+let url = searchParams.get("url") ?? `data/bbb_video_av1_frag.mp4`;
+const video = await Video2.load(renderer, url);
 
 // @ts-expect-error
 window._video = video;
