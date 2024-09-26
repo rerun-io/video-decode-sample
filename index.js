@@ -440,9 +440,9 @@ async function unboxVideo(url) {
     /** @type {HardwareAcceleration} */
     let hardwareAcceleration = "no-preference";
     if (["0", "false"].includes(searchParams.get("hwaccel") || "")) {
-      hardwareAcceleration = "prefer-hardware";
-    } else if (["1", "true"].includes(searchParams.get("hwaccel") || "")) {
       hardwareAcceleration = "prefer-software";
+    } else if (["1", "true"].includes(searchParams.get("hwaccel") || "")) {
+      hardwareAcceleration = "prefer-hardware";
     }
     console.log("hwaccel", hardwareAcceleration);
     videoDecoderConfig = {
