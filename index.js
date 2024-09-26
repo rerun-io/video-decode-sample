@@ -404,7 +404,9 @@ async function* fetchChunks(url) {
   }
 }
 
-/** @param {string} url */
+/**
+ * @param {string} url
+ */
 async function unboxVideo(url) {
   const mp4 = MP4Box.createFile();
 
@@ -435,11 +437,20 @@ async function unboxVideo(url) {
       throw new Error("avcC, hvcC, vpcC, or av1C box not found");
     }
 
+    /** @type {HardwareAcceleration} */
+    let hardwareAcceleration = "no-preference";
+    if (["0", "false"].includes(searchParams.get("hwaccel") || "")) {
+      hardwareAcceleration = "prefer-hardware";
+    } else if (["1", "true"].includes(searchParams.get("hwaccel") || "")) {
+      hardwareAcceleration = "prefer-software";
+    }
+    console.log("hwaccel", hardwareAcceleration);
     videoDecoderConfig = {
       codec: track.codec.startsWith("vp08") ? "vp8" : track.codec,
       codedHeight: track.video.height,
       codedWidth: track.video.width,
       description,
+      hardwareAcceleration,
     };
     timescale = info.timescale;
     duration = info.duration;
