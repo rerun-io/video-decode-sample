@@ -850,6 +850,26 @@ class VideoController {
       setTime(timestamp_ts);
     };
 
+    const seekRelativeFrame = (/** @type {number} */ delta) => {
+      const segment = latestAt(this.video.segments, this.currentTimeTs, (s) => s.start);
+      if (!segment) return;
+
+      const sampleIdx = latestAtIdx(segment.samples, this.currentTimeTs, (s) => s.timestamp);
+      if (!sampleIdx) return;
+
+      const nextSample = segment.samples[sampleIdx + delta];
+      if (!nextSample) return;
+      setTime(nextSample.timestamp);
+    };
+
+    const seekPrevFrame = () => {
+      seekRelativeFrame(-1);
+    };
+
+    const seekNextFrame = () => {
+      seekRelativeFrame(1);
+    };
+
     this.container.addEventListener("pointerdown", (e) => {
       this.dragging = ["start", e.clientX];
     });
@@ -885,6 +905,19 @@ class VideoController {
       }
 
       this.dragging = null;
+    });
+    window.addEventListener("keyup", (e) => {
+      if (e.code === "Space") {
+        if (this.playing == null) {
+          play();
+        } else {
+          pause();
+        }
+      } else if (e.code === "ArrowLeft") {
+        seekPrevFrame();
+      } else if (e.code === "ArrowRight") {
+        seekNextFrame();
+      }
     });
 
     this.button.textContent = icons.play;
